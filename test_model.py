@@ -68,7 +68,7 @@ def load_graph_data() -> tuple:
 
     # Node features
     X = torch.tensor(
-        node_df[["lat_norm", "lon_norm", "crime_count_z"]].values,
+        node_df[["lat_norm", "lon_norm", "crime_count_z", "log_crime_count"]].values,
         dtype=torch.float
     )
 

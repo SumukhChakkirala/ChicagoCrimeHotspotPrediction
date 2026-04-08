@@ -206,7 +206,8 @@ def build_graph(df: pd.DataFrame):
         (node_df["crime_count"] - node_df["crime_count"].mean()) /
         (node_df["crime_count"].std() + 1e-8)
     )
-
+    # Log transform (helps reduce skew)
+    node_df["log_crime_count"] = np.log1p(node_df["crime_count"])
     # Encode dominant crime label per node
     le = LabelEncoder()
     node_df["dominant_label"] = le.fit_transform(node_df["dominant_crime"])

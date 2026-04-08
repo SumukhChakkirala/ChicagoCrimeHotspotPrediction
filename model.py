@@ -46,8 +46,8 @@ HIDDEN_DIM     = 128
 DROPOUT        = 0.5
 LEARNING_RATE  = 0.01
 WEIGHT_DECAY   = 5e-4
-EPOCHS         = 500
-PATIENCE       = 50
+EPOCHS         = 300
+PATIENCE       = 80
 TRAIN_RATIO    = 0.70
 VAL_RATIO      = 0.10
 TEST_RATIO     = 0.20
@@ -75,7 +75,7 @@ def load_graph_data() -> Data:
 
     # ── Node feature matrix X ──────────────────────────────────
     X = torch.tensor(
-        node_df[["lat_norm", "lon_norm", "crime_count_z"]].values,
+        node_df[["lat_norm", "lon_norm", "crime_count_z", "log_crime_count"]].values,
         dtype=torch.float
     )
 
@@ -162,11 +162,11 @@ class CrimeGCN(nn.Module):
     2-layer Graph Convolutional Network for crime type classification.
 
     Architecture:
-        Input (3 features) → GCNConv(128) → ReLU → Dropout
+        Input (4 features) → GCNConv(128) → ReLU → Dropout
                            → GCNConv(num_classes) → log_softmax
 
     Deliberately shallow (2 layers) to:
-      - Prevent over-smoothing on ~500 nodes
+      - Prevent over-smoothing on ~327 nodes
       - Keep localised spatial focus needed for hotspot detection
     """
 
@@ -214,6 +214,17 @@ def train_model(data: Data):
         model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY
     )
 
+    # ─────────────────────────────────────────────────────────────
+    # CLASS WEIGHTS (Original formula - works better for this data)
+    # ─────────────────────────────────────────────────────────────
+    y_np = data.y.cpu().numpy()
+
+    class_counts = np.bincount(y_np)
+    class_weights = 1.0 / np.sqrt(class_counts + 1e-6)
+    class_weights = class_weights / class_weights.sum() * len(class_counts)
+
+    class_weights = torch.tensor(class_weights, dtype=torch.float).to(device)
+
     history = {"train_loss": [], "val_loss": [], "train_acc": [], "val_acc": []}
     best_val_loss    = float("inf")
     patience_counter = 0
@@ -224,7 +235,11 @@ def train_model(data: Data):
         model.train()
         optimizer.zero_grad()
         out  = model(data.x, data.edge_index, data.edge_weight)
-        loss = F.nll_loss(out[data.train_mask], data.y[data.train_mask])
+        loss = F.nll_loss(
+            out[data.train_mask],
+            data.y[data.train_mask],
+            weight=class_weights
+        )
         loss.backward()
         optimizer.step()
 
@@ -235,6 +250,15 @@ def train_model(data: Data):
             val_loss  = F.nll_loss(out[data.val_mask], data.y[data.val_mask]).item()
             train_acc = accuracy(out[data.train_mask], data.y[data.train_mask])
             val_acc   = accuracy(out[data.val_mask],   data.y[data.val_mask])
+
+        preds = out.argmax(dim=1).cpu().numpy()
+        y_true = data.y.cpu().numpy()
+
+        val_f1 = f1_score(
+            y_true[data.val_mask.cpu()],
+            preds[data.val_mask.cpu()],
+            average="macro"
+        )
 
         history["train_loss"].append(loss.item())
         history["val_loss"].append(val_loss)
@@ -254,8 +278,9 @@ def train_model(data: Data):
 
         if epoch % 50 == 0 or epoch == 1:
             print(f"  Epoch {epoch:>4} | Loss: {loss.item():.4f} | "
-                  f"Val Loss: {val_loss:.4f} | "
-                  f"Train Acc: {train_acc:.3f} | Val Acc: {val_acc:.3f}")
+                f"Val Loss: {val_loss:.4f} | "
+                f"Train Acc: {train_acc:.3f} | Val Acc: {val_acc:.3f} | "
+                f"Val F1: {val_f1:.3f}")
 
     model.load_state_dict(best_state)
     return model, data, history
