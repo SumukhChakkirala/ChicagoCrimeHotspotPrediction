@@ -1,0 +1,7 @@
+*.csv
+processed/
+outputs/
+__pycache__/
+*.pt
+node_modules/
+crime-map/node_modules/
