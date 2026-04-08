@@ -259,6 +259,7 @@ Size: ~8 million records, ~1.7 GB
 
 ## 📚 References
 
-* Kipf & Welling, *Semi-Supervised Classification with Graph Convolutional Networks*, ICLR 2017
+* The reference paper used for this project: [*Crime Hotspot Prediction Using Deep Graph Convolutional Networks*](https://arxiv.org/abs/2506.13116)
+* Kipf & Welling (2017) — foundational GCN paper: [*Semi-Supervised Classification with Graph Convolutional Networks*, ICLR 2017](https://arxiv.org/abs/1609.02907)
 * Chicago Crime Dataset — Chicago Data Portal
 * PyTorch Geometric — https://pytorch-geometric.readthedocs.io
