@@ -142,7 +142,7 @@ This will create the `outputs/` folder with:
 Expected output:
 
 ```
-Test Accuracy : ~85%
+Test Accuracy : ~60%
 Macro F1 Score: ~0.55
 ```
 
