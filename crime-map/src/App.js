@@ -91,16 +91,22 @@ export default function App() {
 
   useEffect(() => {
     setLoading(true);
-    const url =
-      selectedType === "ALL"
-        ? `${API}/api/nodes`
-        : `${API}/api/nodes?crime_type=${selectedType}`;
+    const { hour, day_of_week, month } = getTemporalParams();
+    const params = new URLSearchParams({
+      hour: String(hour),
+      day_of_week: String(day_of_week),
+      month: String(month),
+    });
+    if (selectedType !== "ALL") {
+      params.set("crime_type", selectedType);
+    }
+    const url = `${API}/api/nodes?${params.toString()}`;
 
     fetch(url)
       .then((r) => r.json())
       .then((d) => { setNodes(d.nodes); setLoading(false); })
       .catch(() => { setError("Failed to load node data"); setLoading(false); });
-  }, [selectedType]);
+  }, [selectedType, getTemporalParams]);
 
   const handlePredict = useCallback((lat, lon) => {
     const { hour, day_of_week, month } = getTemporalParams();
