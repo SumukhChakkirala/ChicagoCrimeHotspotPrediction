@@ -97,6 +97,23 @@ select:focus, .date-input:focus {
   z-index: 1000;
 }
 
+.map-overlay-warning {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  background: rgba(127, 29, 29, 0.95);
+  border: 2px solid #fca5a5;
+  color: #fca5a5;
+  padding: 20px 30px;
+  border-radius: 10px;
+  font-size: 0.95rem;
+  text-align: center;
+  z-index: 999;
+  font-weight: 500;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.5);
+}
+
 /* ── Legend ─────────────────────────────────────────────── */
 .legend {
   position: absolute;

@@ -19,10 +19,12 @@ function riskLabel(score) {
   return "Low";
 }
 
-function MapClickHandler({ onPredict }) {
+function MapClickHandler({ onPredict, isDisabled }) {
   useMapEvents({
     click(e) {
-      onPredict(e.latlng.lat, e.latlng.lng);
+      if (!isDisabled) {
+        onPredict(e.latlng.lat, e.latlng.lng);
+      }
     },
   });
   return null;
@@ -53,6 +55,9 @@ export default function App() {
   const [nodes, setNodes]               = useState([]);
   const [crimeTypes, setCrimeTypes]     = useState([]);
   const [stats, setStats]               = useState(null);
+  const [mapCenter, setMapCenter]       = useState([41.85, -87.65]);
+  const [mapBounds, setMapBounds]       = useState(null);
+  const [mapTitle, setMapTitle]         = useState("Crime Risk Map");
   const [selectedType, setSelectedType] = useState("ALL");
   const [prediction, setPrediction]     = useState(null);
   const [loading, setLoading]           = useState(true);
@@ -63,9 +68,18 @@ export default function App() {
   const pad = (n) => String(n).padStart(2, "0");
   const defaultDate = `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())}`;
   const defaultTime = `${pad(now.getHours())}:00`;
+  const todayDate = defaultDate;
 
   const [selectedDate, setSelectedDate] = useState(defaultDate);
   const [selectedTime, setSelectedTime] = useState(defaultTime);
+
+  // Check if selected date/time is in the past
+  const isDateTimePast = useCallback(() => {
+    const selected = new Date(`${selectedDate}T${selectedTime}`);
+    return selected < now;
+  }, [selectedDate, selectedTime, now]);
+
+  const isPastSelection = isDateTimePast();
 
   // Parse date/time into hour, dow, month for the API
   const getTemporalParams = useCallback(() => {
@@ -81,10 +95,20 @@ export default function App() {
     Promise.all([
       fetch(`${API}/api/crime-types`).then((r) => r.json()),
       fetch(`${API}/api/stats`).then((r) => r.json()),
+      fetch(`${API}/api/meta`).then((r) => r.json()),
     ])
-      .then(([ct, st]) => {
+      .then(([ct, st, meta]) => {
         setCrimeTypes(["ALL", ...ct.crime_types]);
         setStats(st);
+        if (meta?.center) {
+          setMapCenter([meta.center.lat, meta.center.lon]);
+        }
+        if (meta?.bounds) {
+          setMapBounds(meta.bounds);
+        }
+        if (meta?.title) {
+          setMapTitle(meta.title);
+        }
       })
       .catch(() => setError("Cannot reach API. Is the backend running on port 8000?"));
   }, []);
@@ -109,6 +133,12 @@ export default function App() {
   }, [selectedType, getTemporalParams]);
 
   const handlePredict = useCallback((lat, lon) => {
+    if (isPastSelection) {
+      setError("Cannot predict for past dates. Please select today or a future date.");
+      setTimeout(() => setError(null), 4000);
+      return;
+    }
+
     const { hour, day_of_week, month } = getTemporalParams();
     const body = {
       lat,
@@ -124,21 +154,24 @@ export default function App() {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body),
     })
-      .then((r) => {
-        if (!r.ok) throw new Error("Location is outside Chicago bounds");
+      .then(async (r) => {
+        if (!r.ok) {
+          const err = await r.json().catch(() => ({}));
+          throw new Error(err.detail || "Prediction request failed");
+        }
         return r.json();
       })
       .then((d) => setPrediction({ ...d, clickLat: lat, clickLon: lon }))
       .catch((err) => {
         setPrediction(null);
-        setError(err.message + " — please click within the Chicago city area");
+        setError(err.message);
         setTimeout(() => setError(null), 4000);
       });
-  }, [selectedType, getTemporalParams]);
+  }, [selectedType, getTemporalParams, isPastSelection]);
 
-  // Re-predict when date/time changes if we already have a prediction
+  // Re-predict when date/time changes if we already have a prediction and it's not a past date
   useEffect(() => {
-    if (prediction) {
+    if (prediction && !isPastSelection) {
       handlePredict(prediction.clickLat, prediction.clickLon);
     }
   }, [selectedDate, selectedTime]);
@@ -151,12 +184,19 @@ export default function App() {
     return `${dayNames[day_of_week]}, ${monthNames[month - 1]}, ${hour}:00`;
   };
 
+  const leafletBounds = mapBounds
+    ? [
+        [mapBounds.lat_min - mapBounds.padding_deg, mapBounds.lon_min - mapBounds.padding_deg],
+        [mapBounds.lat_max + mapBounds.padding_deg, mapBounds.lon_max + mapBounds.padding_deg],
+      ]
+    : null;
+
   return (
     <div className="app">
       {/* ── Header ── */}
       <header className="header">
         <div className="header-left">
-          <h1>🗺 Chicago Crime Risk Map</h1>
+          <h1>🗺 {mapTitle}</h1>
           <span className="subtitle">GCN-based spatial crime hotspot prediction</span>
         </div>
         <div className="header-right">
@@ -167,7 +207,9 @@ export default function App() {
               type="date"
               value={selectedDate}
               onChange={(e) => setSelectedDate(e.target.value)}
+              min={todayDate}
               className="date-input"
+              title="Cannot select past dates"
             />
           </div>
           {/* Time picker */}
@@ -195,22 +237,29 @@ export default function App() {
         </div>
       </header>
 
+      {isPastSelection && (
+        <div className="error-banner">ℹ️ Cannot predict for past dates. Please select today or a future date.</div>
+      )}
       {error && <div className="error-banner">{error}</div>}
 
       <div className="main">
         {/* ── Map ── */}
         <div className="map-wrap">
           {loading && <div className="map-loading">Loading nodes…</div>}
+          {isPastSelection && <div className="map-overlay-warning">⚠ Select today or a future date to make predictions</div>}
           <MapContainer
-            center={[41.85, -87.65]}
+            key={`${mapCenter[0]}_${mapCenter[1]}`}
+            center={mapCenter}
             zoom={12}
+            maxBounds={leafletBounds || undefined}
+            maxBoundsViscosity={0.7}
             style={{ height: "100%", width: "100%" }}
           >
             <TileLayer
               url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"
               attribution="© OpenStreetMap contributors"
             />
-            <MapClickHandler onPredict={handlePredict} />
+            <MapClickHandler onPredict={handlePredict} isDisabled={isPastSelection} />
 
             {nodes.map((node, i) => (
               <CircleMarker
@@ -251,7 +300,7 @@ export default function App() {
           <div className="card time-card">
             <h3>🕐 Selected Time</h3>
             <p className="time-display">{temporalInfo()}</p>
-            <p className="time-hint">Click anywhere on the map to predict crime risk for this date & time</p>
+            <p className="time-hint">Click on the map to predict crime risk for this date and time.</p>
           </div>
 
           {/* Stats */}

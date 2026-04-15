@@ -1,22 +1,18 @@
 """
-Chicago Crime Dataset - Data Preprocessing Pipeline
-=====================================================
+Crime Dataset - Data Preprocessing Pipeline
+===========================================
 Step 1 of 4 in the Spatio-Temporal Crime Risk Prediction project.
 
 What this script does:
-  1. Loads the Chicago Crime CSV
-  2. Cleans and filters records
-  3. Engineers temporal + spatial features
-  4. Builds a 2.2km grid and assigns each crime to a cell
-  5. Constructs the graph (nodes + edges) for GCN input
-  6. Saves processed outputs ready for model training
+    1. Loads a supported incident CSV (Chicago legacy or incident-reports schema)
+    2. Cleans and filters records
+    3. Engineers temporal + spatial features
+    4. Builds a grid and assigns each incident to a cell
+    5. Constructs the graph (nodes + edges) for GCN input
+    6. Saves processed outputs ready for model training
 
-Requirements:
-    pip install pandas numpy scikit-learn scipy geopandas tqdm
-
-Dataset:
-    Download from: https://data.cityofchicago.org/Public-Safety/Crimes-2001-to-Present/ijzp-q8t2
-    Export as CSV, rename to: chicago_crimes.csv
+Set a custom CSV path via environment variable:
+        CRIME_INPUT_CSV=/path/to/file.csv
 """
 
 import os
@@ -29,15 +25,21 @@ from tqdm import tqdm
 # ─────────────────────────────────────────────
 # CONFIG
 # ─────────────────────────────────────────────
-INPUT_CSV      = r"C:\Users\karan\OneDrive\Desktop\p\moneypal\6thsem\mlLab\project\Crimes_-_2001_to_Present_20260318.csv"   # path to your downloaded CSV
+INPUT_CSV      = os.getenv("CRIME_INPUT_CSV", "")
+INPUT_CANDIDATES = [
+    "Police_Department_Incident_Reports__2018_to_Present_20260415.csv",
+    "chicago_crimes.csv",
+    "Crimes_-_2001_to_Present_20260318.csv",
+]
 OUTPUT_DIR     = "processed"            # folder where outputs are saved
-GRID_SIZE_KM   = 1.5                    # grid cell size in km
-EDGE_DIST_KM   = 2.5                    # max distance to connect two nodes
-RARE_THRESHOLD = 1000                   # crime types below this → "OTHER"
+GRID_SIZE_KM   = 1.5                     # grid cell size in km
+EDGE_DIST_KM   = 2.5                     # max distance to connect two nodes
+RARE_THRESHOLD = 1000                    # crime types below this -> "OTHER"
+SPATIAL_QUANTILE_TRIM = 0.001            # trim extreme outliers before graphing
 
-# Chicago bounding box (WGS84)
-LAT_MIN, LAT_MAX = 41.6, 42.1
-LON_MIN, LON_MAX = -87.9, -87.5
+# Spatial bounds are inferred from the dataset in load_and_clean().
+LAT_MIN, LAT_MAX = None, None
+LON_MIN, LON_MAX = None, None
 
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
@@ -45,34 +47,152 @@ os.makedirs(OUTPUT_DIR, exist_ok=True)
 # ─────────────────────────────────────────────
 # STEP 1: LOAD & CLEAN
 # ─────────────────────────────────────────────
-def load_and_clean(path: str) -> pd.DataFrame:
-    print("\n[1/5] Loading dataset...")
-    df = pd.read_csv(
-        path,
-        dtype={
-            "Primary Type": "category",
-            "Location Description": "category",
-            "Arrest": bool,
-            "Domestic": bool,
-        },
-        low_memory=False,
+def resolve_input_csv() -> str:
+    """Resolve dataset path from env var or known filenames in project root."""
+    if INPUT_CSV:
+        if os.path.exists(INPUT_CSV):
+            return INPUT_CSV
+        raise FileNotFoundError(
+            f"CRIME_INPUT_CSV points to a missing file: {INPUT_CSV}"
+        )
+
+    for candidate in INPUT_CANDIDATES:
+        if os.path.exists(candidate):
+            return candidate
+
+    candidate_str = ", ".join(INPUT_CANDIDATES)
+    raise FileNotFoundError(
+        "No input CSV found. Set CRIME_INPUT_CSV or place one of these files in the project root: "
+        f"{candidate_str}"
     )
-    print(f"  Raw records: {len(df):,}")
 
-    # Drop rows missing spatial coordinates
-    df = df.dropna(subset=["Latitude", "Longitude"])
-    print(f"  After dropping null coordinates: {len(df):,}")
 
-    # Apply Chicago bounding box filter
-    df = df[
-        (df["Latitude"].between(LAT_MIN, LAT_MAX)) &
-        (df["Longitude"].between(LON_MIN, LON_MAX))
+def detect_schema(columns) -> dict:
+    """Map supported raw schemas to canonical columns used by this pipeline."""
+    colset = set(columns)
+
+    # Chicago Crimes 2001-to-present schema
+    if {"Date", "Primary Type", "Latitude", "Longitude"}.issubset(colset):
+        return {
+            "name": "chicago_legacy",
+            "date_col": "Date",
+            "crime_col": "Primary Type",
+            "lat_col": "Latitude",
+            "lon_col": "Longitude",
+        }
+
+    # Incident reports schema (example: Police_Department_Incident_Reports...)
+    if {"Incident Category", "Latitude", "Longitude"}.issubset(colset):
+        if "Incident Datetime" in colset:
+            date_col = "Incident Datetime"
+        elif "Incident Date" in colset:
+            date_col = "Incident Date"
+        else:
+            raise ValueError(
+                "Incident reports schema detected but missing both 'Incident Datetime' and 'Incident Date'."
+            )
+
+        return {
+            "name": "incident_reports",
+            "date_col": date_col,
+            "crime_col": "Incident Category",
+            "lat_col": "Latitude",
+            "lon_col": "Longitude",
+        }
+
+    raise ValueError(
+        "Unsupported dataset schema. Required columns were not found. "
+        "Expected either Chicago legacy columns (Date, Primary Type, Latitude, Longitude) "
+        "or incident-report columns (Incident Category, Incident Datetime/Incident Date, Latitude, Longitude)."
+    )
+
+
+def load_and_clean(path: str) -> pd.DataFrame:
+    global LAT_MIN, LAT_MAX, LON_MIN, LON_MAX
+
+    print("\n[1/5] Loading dataset...")
+    raw_columns = pd.read_csv(path, nrows=0).columns.tolist()
+    schema = detect_schema(raw_columns)
+
+    usecols = [
+        schema["date_col"],
+        schema["crime_col"],
+        schema["lat_col"],
+        schema["lon_col"],
     ]
-    print(f"  After bounding box filter: {len(df):,}")
 
-    # Parse date
-    df["Date"] = pd.to_datetime(df["Date"], format="%m/%d/%Y %I:%M:%S %p", errors="coerce")
-    df = df.dropna(subset=["Date"])
+    df = pd.read_csv(path, usecols=usecols, low_memory=False)
+    print(f"  Raw records: {len(df):,}")
+    print(f"  Schema detected: {schema['name']}")
+
+    # Canonical columns used by downstream pipeline.
+    df = df.rename(
+        columns={
+            schema["date_col"]: "Date",
+            schema["crime_col"]: "Primary Type",
+            schema["lat_col"]: "Latitude",
+            schema["lon_col"]: "Longitude",
+        }
+    )
+
+    # Numeric coordinates + robust timestamp parsing.
+    df["Latitude"] = pd.to_numeric(df["Latitude"], errors="coerce")
+    df["Longitude"] = pd.to_numeric(df["Longitude"], errors="coerce")
+
+    raw_date = df["Date"].astype("string")
+    preferred_fmt = None
+    if schema["name"] == "incident_reports":
+        preferred_fmt = "%Y/%m/%d %I:%M:%S %p" if schema["date_col"] == "Incident Datetime" else "%Y/%m/%d"
+    elif schema["name"] == "chicago_legacy":
+        preferred_fmt = "%m/%d/%Y %I:%M:%S %p"
+
+    if preferred_fmt is not None:
+        parsed = pd.to_datetime(raw_date, format=preferred_fmt, errors="coerce")
+        missing_mask = parsed.isna()
+        if missing_mask.any():
+            parsed.loc[missing_mask] = pd.to_datetime(raw_date[missing_mask], errors="coerce")
+        df["Date"] = parsed
+    else:
+        df["Date"] = pd.to_datetime(raw_date, errors="coerce")
+
+    # Normalise crime categories and drop unusable rows.
+    df["Primary Type"] = df["Primary Type"].astype("string").str.strip().str.upper()
+    df = df[
+        df["Primary Type"].notna() &
+        (df["Primary Type"] != "") &
+        (df["Primary Type"] != "<NA>")
+    ]
+
+    df = df.dropna(subset=["Latitude", "Longitude", "Date"])
+    print(f"  After dropping rows missing key fields: {len(df):,}")
+
+    if df.empty:
+        raise ValueError("No valid rows available after cleaning key fields.")
+
+    # Trim extreme coordinate outliers using quantiles.
+    q = SPATIAL_QUANTILE_TRIM
+    lat_lo, lat_hi = df["Latitude"].quantile([q, 1 - q])
+    lon_lo, lon_hi = df["Longitude"].quantile([q, 1 - q])
+    df = df[
+        df["Latitude"].between(lat_lo, lat_hi) &
+        df["Longitude"].between(lon_lo, lon_hi)
+    ]
+    print(f"  After spatial outlier trim: {len(df):,}")
+
+    if df.empty:
+        raise ValueError("No valid rows remained after spatial filtering.")
+
+    # Spatial bounds are dataset-specific and used by griding + normalisation.
+    LAT_MIN = float(df["Latitude"].min())
+    LAT_MAX = float(df["Latitude"].max())
+    LON_MIN = float(df["Longitude"].min())
+    LON_MAX = float(df["Longitude"].max())
+
+    print(
+        "  Spatial bounds: "
+        f"lat [{LAT_MIN:.6f}, {LAT_MAX:.6f}], "
+        f"lon [{LON_MIN:.6f}, {LON_MAX:.6f}]"
+    )
 
     return df.reset_index(drop=True)
 
@@ -159,6 +279,9 @@ def haversine_km(lat1, lon1, lat2, lon2):
 def build_spatial_grid(df: pd.DataFrame) -> pd.DataFrame:
     print("\n[4/5] Building spatial grid...")
 
+    if any(v is None for v in (LAT_MIN, LAT_MAX, LON_MIN, LON_MAX)):
+        raise RuntimeError("Spatial bounds are unset. Run load_and_clean() first.")
+
     # Degrees per km (approximate)
     lat_per_km = 1 / 110.574
     lon_per_km = 1 / (111.320 * np.cos(np.radians((LAT_MIN + LAT_MAX) / 2)))
@@ -198,8 +321,10 @@ def build_graph(df: pd.DataFrame):
     )
 
     # Normalise coordinates to [0, 1]
-    node_df["lat_norm"] = (node_df["lat"] - LAT_MIN) / (LAT_MAX - LAT_MIN)
-    node_df["lon_norm"] = (node_df["lon"] - LON_MIN) / (LON_MAX - LON_MIN)
+    lat_range = max(LAT_MAX - LAT_MIN, 1e-8)
+    lon_range = max(LON_MAX - LON_MIN, 1e-8)
+    node_df["lat_norm"] = (node_df["lat"] - LAT_MIN) / lat_range
+    node_df["lon_norm"] = (node_df["lon"] - LON_MIN) / lon_range
 
     # Z-normalise crime count
     node_df["crime_count_z"] = (
@@ -219,9 +344,6 @@ def build_graph(df: pd.DataFrame):
     print(f"  Nodes: {n_nodes}")
 
     # ── Edge construction via KD-Tree ───────────────────────────
-    # Convert lat/lon to radians for BallTree-style query
-    coords_rad = np.radians(node_df[["lat", "lon"]].values)
-
     # Build KD-Tree on (lat, lon) in degrees — fast O(n log n) neighbour search
     tree = cKDTree(node_df[["lat", "lon"]].values)
 
@@ -241,8 +363,10 @@ def build_graph(df: pd.DataFrame):
                     weight = 1.0 / (dist_km + 1e-6)
                     edges.append({"src": i, "dst": j, "weight": weight, "dist_km": dist_km})
 
-    edge_df = pd.DataFrame(edges).drop_duplicates(subset=["src", "dst"])
-    print(f"  Edges: {len(edge_df):,}  |  Avg degree: {len(edge_df)/n_nodes:.2f}")
+    edge_df = pd.DataFrame(edges, columns=["src", "dst", "weight", "dist_km"])
+    if not edge_df.empty:
+        edge_df = edge_df.drop_duplicates(subset=["src", "dst"])
+    print(f"  Edges: {len(edge_df):,}  |  Avg degree: {len(edge_df)/max(n_nodes, 1):.2f}")
 
     # ── Save outputs ────────────────────────────────────────────
     crimes_out = f"{OUTPUT_DIR}/crimes_processed.csv"
@@ -265,10 +389,13 @@ def build_graph(df: pd.DataFrame):
 # ─────────────────────────────────────────────
 def main():
     print("=" * 55)
-    print("  Chicago Crime — Preprocessing Pipeline")
+    print("  Crime Risk — Preprocessing Pipeline")
     print("=" * 55)
 
-    df = load_and_clean(INPUT_CSV)
+    input_csv = resolve_input_csv()
+    print(f"  Input CSV : {input_csv}")
+
+    df = load_and_clean(input_csv)
     df = add_temporal_features(df)
     df = consolidate_crime_types(df)
     df = build_spatial_grid(df)

@@ -29,7 +29,7 @@ PREDICTIONS_CSV  = "outputs/node_predictions.csv"
 CRIMES_CSV       = "processed/crimes_processed.csv"
 
 app = FastAPI(
-    title="Chicago Crime Risk API",
+    title="Crime Risk API",
     description="Serves GCN-based crime hotspot predictions",
     version="1.0.0"
 )
@@ -48,6 +48,11 @@ node_df          = None
 crimes_df        = None
 crime_types      = []
 prob_cols        = []
+LAT_MIN          = None
+LAT_MAX          = None
+LON_MIN          = None
+LON_MAX          = None
+BOUNDARY_PADDING_DEG = 0.01
 
 # Temporal multipliers — computed from historical data
 # shape: {grid_id: {crime_type: {hour: multiplier, month: multiplier, dow: multiplier}}}
@@ -56,15 +61,29 @@ temporal_index   = {}
 @app.on_event("startup")
 def load_data():
     global node_df, crimes_df, crime_types, prob_cols, temporal_index
+    global LAT_MIN, LAT_MAX, LON_MIN, LON_MAX
 
     if not os.path.exists(PREDICTIONS_CSV):
         raise RuntimeError(f"Missing {PREDICTIONS_CSV} — run model.py first")
 
     node_df   = pd.read_csv(PREDICTIONS_CSV)
+    if node_df.empty:
+        raise RuntimeError(f"{PREDICTIONS_CSV} is empty")
+
+    LAT_MIN = float(node_df["lat"].min())
+    LAT_MAX = float(node_df["lat"].max())
+    LON_MIN = float(node_df["lon"].min())
+    LON_MAX = float(node_df["lon"].max())
+
     prob_cols   = [c for c in node_df.columns if c.startswith("prob_")]
     crime_types = [c.replace("prob_", "") for c in prob_cols]
 
     print(f"✓ Loaded {len(node_df)} nodes with {len(crime_types)} crime types")
+    print(
+        "  Spatial bounds: "
+        f"lat [{LAT_MIN:.6f}, {LAT_MAX:.6f}], "
+        f"lon [{LON_MIN:.6f}, {LON_MAX:.6f}]"
+    )
 
     # Build temporal index from historical crimes
     if os.path.exists(CRIMES_CSV):
@@ -173,6 +192,17 @@ def find_nearest_node(lat: float, lon: float) -> pd.Series:
     return node_df.iloc[dists.argmin()]
 
 
+def within_dataset_bounds(lat: float, lon: float) -> bool:
+    if any(v is None for v in (LAT_MIN, LAT_MAX, LON_MIN, LON_MAX)):
+        return False
+
+    lat_min = LAT_MIN - BOUNDARY_PADDING_DEG
+    lat_max = LAT_MAX + BOUNDARY_PADDING_DEG
+    lon_min = LON_MIN - BOUNDARY_PADDING_DEG
+    lon_max = LON_MAX + BOUNDARY_PADDING_DEG
+    return lat_min <= lat <= lat_max and lon_min <= lon <= lon_max
+
+
 def row_to_dict(row: pd.Series) -> dict:
     risk_scores = {ct: round(float(row[f"prob_{ct}"]), 4) for ct in crime_types}
     dominant    = max(risk_scores, key=risk_scores.get)
@@ -193,7 +223,28 @@ def row_to_dict(row: pd.Series) -> dict:
 # ─────────────────────────────────────────────
 @app.get("/")
 def root():
-    return {"status": "ok", "message": "Chicago Crime Risk API is running"}
+    return {"status": "ok", "message": "Crime Risk API is running"}
+
+
+@app.get("/api/meta")
+def get_meta():
+    if any(v is None for v in (LAT_MIN, LAT_MAX, LON_MIN, LON_MAX)):
+        raise HTTPException(500, "Dataset bounds are unavailable")
+
+    return {
+        "title": "Crime Risk Map",
+        "bounds": {
+            "lat_min": LAT_MIN,
+            "lat_max": LAT_MAX,
+            "lon_min": LON_MIN,
+            "lon_max": LON_MAX,
+            "padding_deg": BOUNDARY_PADDING_DEG,
+        },
+        "center": {
+            "lat": (LAT_MIN + LAT_MAX) / 2,
+            "lon": (LON_MIN + LON_MAX) / 2,
+        },
+    }
 
 
 @app.get("/api/nodes")
@@ -252,8 +303,15 @@ class PredictRequest(BaseModel):
 def predict(req: PredictRequest):
     if not (-90 <= req.lat <= 90) or not (-180 <= req.lon <= 180):
         raise HTTPException(400, "Invalid coordinates")
-    if not (41.6 <= req.lat <= 42.1 and -87.9 <= req.lon <= -87.5):
-        raise HTTPException(400, "Coordinates are outside Chicago bounds")
+    if not within_dataset_bounds(req.lat, req.lon):
+        raise HTTPException(
+            400,
+            (
+                "Coordinates are outside dataset bounds: "
+                f"lat [{LAT_MIN:.4f}, {LAT_MAX:.4f}], "
+                f"lon [{LON_MIN:.4f}, {LON_MAX:.4f}]"
+            ),
+        )
 
     node   = find_nearest_node(req.lat, req.lon)
     result = row_to_dict(node)
